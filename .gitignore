@@ -6,5 +6,3 @@ app/Data/
 .env.old
 .phpunit.cache/
 
-# Browser-exported Freenom cookies; contains login secrets.
-cookies.txt
