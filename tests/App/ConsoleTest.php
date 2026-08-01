@@ -16,6 +16,7 @@ use Luolongfei\Tests\TestCase;
 class TestableFreeNom extends FreeNom
 {
     public array $renewResults = [];
+    public array $renewedIds = [];
 
     public function __construct()
     {
@@ -23,6 +24,8 @@ class TestableFreeNom extends FreeNom
 
     protected function renew(int $id, string $token)
     {
+        $this->renewedIds[] = $id;
+
         return $this->renewResults[$id] ?? false;
     }
 }
@@ -237,5 +240,6 @@ HTML;
         ];
 
         $this->assertTrue($freeNom->renewAllDomains($domains, 'token'));
+        $this->assertSame([1, 2], $freeNom->renewedIds);
     }
 }
