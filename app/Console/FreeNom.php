@@ -10,10 +10,13 @@
 
 namespace Luolongfei\App\Console;
 
+use Luolongfei\App\Constants\CommonConst;
 use Luolongfei\App\Exceptions\LlfException;
 use Luolongfei\App\Exceptions\WarningException;
 use GuzzleHttp\Client;
+use GuzzleHttp\Pool;
 use GuzzleHttp\Cookie\CookieJar;
+use GuzzleHttp\Exception\RequestException;
 use Luolongfei\Libs\Log;
 use Luolongfei\Libs\Message;
 use GuzzleHttp\Cookie\SetCookie;
@@ -38,6 +41,9 @@ class FreeNom extends Base
 
     // 免费域名只允许在到期前 14 天内续期
     const RENEW_BEFORE_DAYS = 14;
+
+    // 续期请求最大并发数
+    const RENEW_CONCURRENCY = 10;
 
     // 匹配 token 的正则
     const TOKEN_REGEX = '/<input\b[^>]*\bname=["\']token["\'][^>]*\bvalue=["\'](?P<token>[^"\']+)/i';
@@ -585,6 +591,50 @@ class FreeNom extends Base
     }
 
     /**
+     * 将 My Domains 页面中的 domain id 合并到续期页域名列表
+     *
+     * @param array $allDomains
+     * @param array $domainIdMap
+     *
+     * @return array
+     */
+    protected function fillDomainIds(array $allDomains, array $domainIdMap)
+    {
+        foreach ($allDomains as &$domainInfo) {
+            $domain = isset($domainInfo['domain']) ? strtolower((string)$domainInfo['domain']) : '';
+            if ($domain !== '' && isset($domainIdMap[$domain])) {
+                $domainInfo['id'] = $domainIdMap[$domain];
+            }
+
+            if (!isset($domainInfo['id'])) {
+                $domainInfo['id'] = '';
+            }
+        }
+        unset($domainInfo);
+
+        return $allDomains;
+    }
+
+    /**
+     * 是否存在已进入续期窗口的域名
+     *
+     * @param array $allDomains
+     *
+     * @return bool
+     */
+    protected function hasRenewableDomains(array $allDomains)
+    {
+        foreach ($allDomains as $domainInfo) {
+            $days = isset($domainInfo['days']) ? (int)$domainInfo['days'] : 0;
+            if ($days <= self::RENEW_BEFORE_DAYS) {
+                return true;
+            }
+        }
+
+        return false;
+    }
+
+    /**
      * 获取匹配 token
      *
      * 据观察，每次登录后此 token 不会改变，故可以只获取一次，多次使用
@@ -681,6 +731,8 @@ class FreeNom extends Base
         $renewalFailuresArr = [];
         $domainStatusArr = [];
 
+        $renewalDomains = [];
+
         foreach ($allDomains as $d) {
             $domain = $d['domain'];
             $days = isset($d['days']) ? (int)$d['days'] : 0;
@@ -695,18 +747,30 @@ class FreeNom extends Base
                     continue;
                 }
 
-                $renewalResult = $this->renew($id, $token);
+                $renewalDomains[] = [
+                    'domain' => $domain,
+                    'days' => $days,
+                    'id' => $id,
+                ];
 
-                if ($renewalResult) {
-                    $renewalSuccessArr[] = $domain;
-
-                    continue; // 续期成功的域名无需记录过期天数
-                } else {
-                    $renewalFailuresArr[] = $domain;
-                }
+                continue;
             }
 
-            // 记录无需续期或续期失败域名的剩余天数
+            // 记录无需续期域名的剩余天数
+            $domainStatusArr[$domain] = $days;
+        }
+
+        foreach ($this->renewDomainsConcurrently($renewalDomains, $token) as $renewalResult) {
+            $domain = $renewalResult['domain'];
+            $days = $renewalResult['days'];
+
+            if ($renewalResult['success']) {
+                $renewalSuccessArr[] = $domain;
+
+                continue; // 续期成功的域名无需记录过期天数
+            }
+
+            $renewalFailuresArr[] = $domain;
             $domainStatusArr[$domain] = $days;
         }
 
@@ -749,6 +813,173 @@ class FreeNom extends Base
     }
 
     /**
+     * 并发续期域名
+     *
+     * @param array $renewalDomains
+     * @param string $token
+     *
+     * @return array
+     */
+    protected function renewDomainsConcurrently(array $renewalDomains, string $token)
+    {
+        if (empty($renewalDomains)) {
+            return [];
+        }
+
+        $results = [];
+        $requests = function () use ($renewalDomains, $token) {
+            foreach ($renewalDomains as $index => $domainInfo) {
+                yield $index => function () use ($domainInfo, $token) {
+                    return $this->renewAsync((int)$domainInfo['id'], $token)
+                        ->then(function ($success) use ($domainInfo) {
+                            return [
+                                'domain' => $domainInfo['domain'],
+                                'days' => (int)$domainInfo['days'],
+                                'id' => (int)$domainInfo['id'],
+                                'success' => (bool)$success,
+                            ];
+                        });
+                };
+            }
+        };
+
+        $pool = new Pool($this->client, $requests(), [
+            'concurrency' => self::RENEW_CONCURRENCY,
+            'fulfilled' => function ($result, $index) use (&$results) {
+                $results[$index] = $result;
+            },
+            'rejected' => function ($reason, $index) use (&$results, $renewalDomains) {
+                $domainInfo = $renewalDomains[$index];
+                $id = (int)$domainInfo['id'];
+                $message = $reason instanceof \Throwable ? $reason->getMessage() : (string)$reason;
+                $errorMsg = sprintf(lang('100046'), $message, $id, $this->username);
+                system_log($errorMsg);
+                Message::send($errorMsg);
+
+                $results[$index] = [
+                    'domain' => $domainInfo['domain'],
+                    'days' => (int)$domainInfo['days'],
+                    'id' => $id,
+                    'success' => false,
+                ];
+            },
+        ]);
+
+        $pool->promise()->wait();
+        ksort($results);
+
+        return array_values($results);
+    }
+
+    /**
+     * 获取异步请求失败状态码
+     *
+     * @param mixed $reason
+     *
+     * @return int
+     */
+    protected function getFailureStatusCode($reason)
+    {
+        if ($reason instanceof RequestException && $reason->hasResponse()) {
+            return $reason->getResponse()->getStatusCode();
+        }
+
+        if ($reason instanceof \Throwable && preg_match('/\b(?P<code>[1-5]\d{2})\b/', $reason->getMessage(), $matches)) {
+            return (int)$matches['code'];
+        }
+
+        return 0;
+    }
+
+    /**
+     * 并发续期遇到 405 时刷新 AWS WAF token
+     *
+     * cookies 模式不处理 aws-waf-token。
+     *
+     * @param mixed $reason
+     *
+     * @return bool
+     */
+    protected function refreshAwsWafTokenForRenewal($reason)
+    {
+        if ($this->cookieSessionMode || $this->getFailureStatusCode($reason) !== 405) {
+            return false;
+        }
+
+        system_log('检测到 405 人机验证，重新获取 aws waf token');
+        delGlobalValue(CommonConst::AWS_WAF_TOKEN);
+        $this->jar->setCookie(buildAwsWafCookie(getAwsWafToken()));
+
+        return true;
+    }
+
+    /**
+     * 异步续期单个域名，失败时按最大重试次数重试
+     *
+     * @param int $id
+     * @param string $token
+     * @param int $retryCount
+     *
+     * @return \GuzzleHttp\Promise\PromiseInterface
+     */
+    protected function renewAsync(int $id, string $token, int $retryCount = 0)
+    {
+        return $this->client->postAsync(self::RENEW_DOMAIN_URL, $this->getRenewRequestOptions($id, $token))
+            ->then(function ($resp) {
+                $body = (string)$resp->getBody();
+
+                return stripos($body, 'Order Confirmation') !== false;
+            }, function ($reason) use ($id, $token, $retryCount) {
+                if ($retryCount < $this->maxRequestRetryCount) {
+                    try {
+                        $this->refreshAwsWafTokenForRenewal($reason);
+                    } catch (\Throwable $e) {
+                        $message = $e->getMessage();
+                        $errorMsg = sprintf(lang('100046'), $message, $id, $this->username);
+                        system_log($errorMsg);
+                        Message::send($errorMsg);
+
+                        return false;
+                    }
+
+                    return $this->renewAsync($id, $token, $retryCount + 1);
+                }
+
+                $message = $reason instanceof \Throwable ? $reason->getMessage() : (string)$reason;
+                $errorMsg = sprintf(lang('100046'), $message, $id, $this->username);
+                system_log($errorMsg);
+                Message::send($errorMsg);
+
+                return false;
+            });
+    }
+
+    /**
+     * 构造续期请求参数
+     *
+     * @param int $id
+     * @param string $token
+     *
+     * @return array
+     */
+    protected function getRenewRequestOptions(int $id, string $token)
+    {
+        return [
+            'headers' => [
+                'Referer' => sprintf('https://my.freenom.com/domains.php?a=renewdomain&domain=%s', $id),
+                'Content-Type' => 'application/x-www-form-urlencoded'
+            ],
+            'form_params' => [
+                'token' => $token,
+                'renewalid' => $id,
+                sprintf('renewalperiod[%s]', $id) => '12M', // 续期一年
+                'paymentmethod' => 'credit', // 支付方式：信用卡
+            ],
+            'cookies' => $this->jar
+        ];
+    }
+
+    /**
      * 续期单个域名
      *
      * @param int $id
@@ -760,19 +991,10 @@ class FreeNom extends Base
     {
         try {
             $resp = autoRetry(function ($token, $id, &$jar) {
-                return $this->client->post(self::RENEW_DOMAIN_URL, [
-                    'headers' => [
-                        'Referer' => sprintf('https://my.freenom.com/domains.php?a=renewdomain&domain=%s', $id),
-                        'Content-Type' => 'application/x-www-form-urlencoded'
-                    ],
-                    'form_params' => [
-                        'token' => $token,
-                        'renewalid' => $id,
-                        sprintf('renewalperiod[%s]', $id) => '12M', // 续期一年
-                        'paymentmethod' => 'credit', // 支付方式：信用卡
-                    ],
-                    'cookies' => $jar
-                ]);
+                $options = $this->getRenewRequestOptions($id, $token);
+                $options['cookies'] = $jar;
+
+                return $this->client->post(self::RENEW_DOMAIN_URL, $options);
             }, $this->maxRequestRetryCount, [$token, $id, &$this->jar], !$this->cookieSessionMode);
 
             $resp = (string)$resp->getBody();
@@ -923,10 +1145,18 @@ class FreeNom extends Base
                     $this->login($this->username, $this->password);
                 }
 
-                $domainIdMap = $this->getDomainIdMap($this->getDomainListPage());
                 $domainStatusPage = $this->getDomainStatusPage();
-                $allDomains = $this->getAllDomains($domainStatusPage, $domainIdMap);
+                $allDomains = $this->getAllDomains($domainStatusPage);
                 $token = $this->getToken($domainStatusPage);
+
+                if ($this->hasRenewableDomains($allDomains)) {
+                    try {
+                        $domainIdMap = $this->getDomainIdMap($this->getDomainListPage());
+                        $allDomains = $this->fillDomainIds($allDomains, $domainIdMap);
+                    } catch (LlfException $e) {
+                        system_log(sprintf(lang('100129'), $e->getMessage()));
+                    }
+                }
 
                 $this->renewAllDomains($allDomains, $token);
             } catch (WarningException $e) {
